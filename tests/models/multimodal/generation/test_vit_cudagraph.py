@@ -356,6 +356,22 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
         },
         skip=True,  # TODO: Re-enable this once OOM issues are resolved on CI.
     ),
+    "dots_ocr": VitCudagraphTestConfig(
+        model="rednote-hilab/dots.ocr",
+        modalities=["image"],
+        image_prompt=(
+            "<|user|><|img|><|imgpad|><|endofimg|>What is in this image?"
+            "<|endofuser|><|assistant|>"
+        ),
+        vllm_runner_kwargs={
+            "load_format": "dummy",
+            "trust_remote_code": True,
+            "hf_overrides": partial(
+                dummy_hf_overrides,
+                model_arch="DotsOCRForCausalLM",
+            ),
+        },
+    ),
     "gemma4": VitCudagraphTestConfig(
         model="google/gemma-4-E2B-it",
         image_prompt=(
