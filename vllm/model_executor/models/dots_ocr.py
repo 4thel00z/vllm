@@ -8,6 +8,10 @@ import torch.nn as nn
 from torch.nn import LayerNorm
 from transformers.models.qwen2_vl import Qwen2VLProcessor
 
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.config import VllmConfig
 from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import utils as dist_utils
@@ -168,6 +172,13 @@ class VisionRotaryEmbedding(nn.Module):
         return freqs
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class PatchMerger(nn.Module):
     def __init__(
         self,
@@ -272,9 +283,9 @@ class DotsVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor | None = None,
-        *,
-        max_seqlen: torch.Tensor | None = None,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: torch.Tensor,
     ) -> torch.Tensor:
         # [S, C] -> [S, B=1, C]
         x = hidden_states.unsqueeze(1)
@@ -286,14 +297,13 @@ class DotsVisionAttention(nn.Module):
         k = k.permute(1, 0, 2, 3).contiguous()
         v = v.permute(1, 0, 2, 3).contiguous()
 
-        if rotary_pos_emb is not None:
-            qk_concat = torch.cat([q, k], dim=0)
-            qk_rotated = self.apply_rotary_emb(
-                qk_concat,
-                rotary_pos_emb.cos(),
-                rotary_pos_emb.sin(),
-            )
-            q, k = torch.chunk(qk_rotated, 2, dim=0)
+        qk_concat = torch.cat([q, k], dim=0)
+        qk_rotated = self.apply_rotary_emb(
+            qk_concat,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+        )
+        q, k = torch.chunk(qk_rotated, 2, dim=0)
 
         context_layer = self.attn(
             query=q,
@@ -350,6 +360,13 @@ class DotsSwiGLUFFN(nn.Module):
         return x
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class DotsPatchEmbed(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -366,7 +383,7 @@ class DotsPatchEmbed(nn.Module):
         )
         self.norm = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, grid_thw=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(
             -1,
             self.num_channels,
@@ -388,11 +405,20 @@ class DotsViTPreprocessor(nn.Module):
         self.config = config
         self.patchifier = DotsPatchEmbed(config)
 
-    def forward(self, x: torch.Tensor, grid_thw=None) -> torch.Tensor:
-        tokens = self.patchifier(x, grid_thw)
-        return tokens
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.patchifier(x)
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "hidden_states": 0,
+        "cu_seqlens": 0,
+        "rotary_pos_emb_cos": 0,
+        "rotary_pos_emb_sin": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class DotsVisionBlock(nn.Module):
     def __init__(
         self,
@@ -422,15 +448,16 @@ class DotsVisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        *,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
-        max_seqlen: torch.Tensor | None = None,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
@@ -532,8 +559,8 @@ class DotsVisionTransformer(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor | None:
-        max_seqlen = None
+    def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        max_seqlen = torch.zeros([], device=cu_seqlens.device)
         if self.attn_backend in {
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.ROCM_AITER_FA,
@@ -546,13 +573,15 @@ class DotsVisionTransformer(nn.Module):
         self, hidden_states: torch.Tensor, grid_thw: list[list[int]]
     ) -> torch.Tensor:
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb_cos = rotary_pos_emb.cos()
+        rotary_pos_emb_sin = rotary_pos_emb.sin()
 
         # Convert grid_thw to tensor (always expecting list format now)
         grid_thw_tensor = torch.tensor(
             grid_thw, device=hidden_states.device, dtype=torch.long
         )
         hidden_states = hidden_states.to(self.dtype)
-        hidden_states = self.patch_embed(hidden_states, grid_thw_tensor)
+        hidden_states = self.patch_embed(hidden_states)
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2], grid_thw_tensor[:, 0]
@@ -567,7 +596,8 @@ class DotsVisionTransformer(nn.Module):
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
             )
 

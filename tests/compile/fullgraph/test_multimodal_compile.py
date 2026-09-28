@@ -74,6 +74,34 @@ def test_qwen2_5_vl_no_vit_compilation(vllm_runner, monkeypatch):
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_dots_ocr_compilation(vllm_runner, monkeypatch):
+    """Test that dots.ocr vision submodules are compiled.
+
+    dots.ocr has 45 models in total - the LLM backbone, DotsPatchEmbed,
+    PatchMerger, and 42 DotsVisionBlock (one per vision layer).
+    """
+    # Disable multiprocessing so that the counter is in the same process
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    with (
+        compilation_counter.expect(num_models_seen=45),
+        vllm_runner(
+            "rednote-hilab/dots.ocr",
+            max_model_len=2048,
+            gpu_memory_utilization=0.8,
+            trust_remote_code=True,
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": True,
+            },
+        ) as _,
+    ):
+        pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
 # Requires Cuda and 8 gpus as well
 @pytest.mark.forked
 @pytest.mark.skip(reason="Skipping due to CI resource constraints")
